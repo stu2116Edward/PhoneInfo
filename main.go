@@ -338,7 +338,10 @@ func processPhonesStreaming(inputFile, outputFile string, db *PhoneDatabase) err
 	}
 
 	// 编译手机号正则表达式（支持11位数字）
-	phoneRegex := regexp.MustCompile(`1[3-9]\d{9}`)
+	// \b - 单词边界，确保手机号前后不是数字、字母或下划线
+	// 1[3-9]\d{9} - 匹配11位手机号（1开头，第二位3-9，后面9位数字）
+	// \b - 单词边界，确保手机号结束后也不是数字、字母或下划线
+	phoneRegex := regexp.MustCompile(`\b1[3-9]\d{9}\b`)
 
 	// 创建带缓冲的读取器
 	reader := bufio.NewReader(input)
