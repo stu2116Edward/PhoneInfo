@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
@@ -27,7 +28,9 @@ var debug bool
 
 // PhoneDatabase 手机号数据库
 type PhoneDatabase struct {
-	records map[string]*PhoneInfo // key: 手机号前7位
+	records  map[string]*PhoneInfo // key: 手机号前7位
+	prefixes []string              // 排序后的前缀列表，用于二分查找
+	sorted   bool                  // 是否已排序
 }
 
 // PhoneInfo 查询结果
@@ -90,8 +93,9 @@ func main() {
 			// 提取前7位作为查询key
 			phonePrefix := phone[0:7]
 
-			// 查询归属地
-			if info, ok := db.records[phonePrefix]; ok {
+			// 查询归属地（使用二分查找）
+			info := db.Query(phonePrefix)
+			if info != nil {
 				result.Success = true
 				result.Province = info.Province
 				result.City = info.City
@@ -110,8 +114,6 @@ func main() {
 		}
 
 		results = append(results, result)
-
-		// 避免请求过快（可选）
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -139,17 +141,20 @@ func LoadPhoneDatabase(filename string) (*PhoneDatabase, error) {
 	defer file.Close()
 
 	db := &PhoneDatabase{
-		records: make(map[string]*PhoneInfo),
+		records:  make(map[string]*PhoneInfo),
+		prefixes: make([]string, 0),
+		sorted:   false,
 	}
 
 	scanner := bufio.NewScanner(file)
-	// 设置更大的缓冲区
+	// 设置更大的缓冲区（支持大文件）
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 1024*1024)
 
 	lineNum := 0
 	successCount := 0
 	errorCount := 0
+	skipCount := 0
 
 	fmt.Println("📖 正在解析数据库文件...")
 
@@ -166,7 +171,7 @@ func LoadPhoneDatabase(filename string) (*PhoneDatabase, error) {
 		parts := strings.Split(line, "|")
 		if len(parts) < 6 {
 			errorCount++
-			if errorCount <= 5 {
+			if errorCount <= 5 && debug {
 				fmt.Printf("   ⚠️ 第%d行格式错误(字段数不足): %s\n", lineNum, line)
 			}
 			continue
@@ -180,25 +185,23 @@ func LoadPhoneDatabase(filename string) (*PhoneDatabase, error) {
 		// 提取手机号段（前7位）
 		phonePrefix := parts[0]
 
-		// 验证号段是否为7位数字
+		// 验证号段
 		if len(phonePrefix) != 7 {
-			// 可能是数字字符串，确保长度
 			if len(phonePrefix) > 7 {
 				phonePrefix = phonePrefix[:7]
 			} else if len(phonePrefix) < 7 {
-				// 补零？或者跳过
+				skipCount++
 				continue
 			}
 		}
 
 		// 验证是否为数字
 		if !isNumeric(phonePrefix) {
+			skipCount++
 			continue
 		}
 
 		// 解析字段
-		// parts[0]: 号段, parts[1]: 省份, parts[2]: 城市,
-		// parts[3]: 邮编, parts[4]: 区号, parts[5]: 运营商
 		province := parts[1]
 		city := parts[2]
 		zipCode := parts[3]
@@ -216,6 +219,10 @@ func LoadPhoneDatabase(filename string) (*PhoneDatabase, error) {
 			cardType = "未知"
 		}
 
+		// 运营商名称标准化
+		cardType = normalizeCardType(cardType)
+
+		// 存储到map
 		db.records[phonePrefix] = &PhoneInfo{
 			Province: province,
 			City:     city,
@@ -223,6 +230,7 @@ func LoadPhoneDatabase(filename string) (*PhoneDatabase, error) {
 			AreaCode: areaCode,
 			CardType: cardType,
 		}
+		db.prefixes = append(db.prefixes, phonePrefix)
 		successCount++
 	}
 
@@ -231,11 +239,71 @@ func LoadPhoneDatabase(filename string) (*PhoneDatabase, error) {
 	}
 
 	if successCount == 0 {
-		return nil, fmt.Errorf("没有解析到任何有效数据，共处理 %d 行，%d 个错误", lineNum, errorCount)
+		return nil, fmt.Errorf("没有解析到任何有效数据，共处理 %d 行，%d 个错误，%d 行跳过", lineNum, errorCount, skipCount)
 	}
 
-	fmt.Printf("   ✅ 成功解析 %d 条号段记录，跳过 %d 行错误\n", successCount, errorCount)
+	// 排序前缀列表，用于二分查找
+	sort.Strings(db.prefixes)
+	db.sorted = true
+
+	fmt.Printf("   ✅ 成功解析 %d 条号段记录，跳过 %d 行错误，%d 行无效数据\n", successCount, errorCount, skipCount)
 	return db, nil
+}
+
+// normalizeCardType 标准化运营商名称
+func normalizeCardType(cardType string) string {
+	cardTypeLower := strings.ToLower(cardType)
+	switch {
+	case strings.Contains(cardTypeLower, "移动"):
+		return "中国移动"
+	case strings.Contains(cardTypeLower, "联通"):
+		return "中国联通"
+	case strings.Contains(cardTypeLower, "电信"):
+		return "中国电信"
+	case strings.Contains(cardTypeLower, "广电"):
+		return "中国广电"
+	default:
+		return cardType
+	}
+}
+
+// Query 使用二分查找查询手机号归属地
+func (db *PhoneDatabase) Query(phonePrefix string) *PhoneInfo {
+	if !db.sorted {
+		// 如果未排序，先排序
+		sort.Strings(db.prefixes)
+		db.sorted = true
+	}
+
+	// 二分查找
+	idx := sort.SearchStrings(db.prefixes, phonePrefix)
+
+	// 精确匹配
+	if idx < len(db.prefixes) && db.prefixes[idx] == phonePrefix {
+		if info, ok := db.records[phonePrefix]; ok {
+			return info
+		}
+	}
+
+	// 如果没找到，尝试模糊匹配（前缀匹配）
+	// 例如：1380000 可能对应 138 开头的号段
+	if len(phonePrefix) == 7 {
+		// 尝试前6位、前5位等
+		for i := 6; i >= 3; i-- {
+			shortPrefix := phonePrefix[:i]
+			searchIdx := sort.SearchStrings(db.prefixes, shortPrefix)
+			if searchIdx < len(db.prefixes) && strings.HasPrefix(db.prefixes[searchIdx], shortPrefix) {
+				if info, ok := db.records[db.prefixes[searchIdx]]; ok {
+					if debug {
+						fmt.Printf("\n[DEBUG] 模糊匹配: %s -> %s\n", phonePrefix, db.prefixes[searchIdx])
+					}
+					return info
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 // 从文件读取手机号
@@ -251,12 +319,10 @@ func readPhonesFromFile(filename string) ([]string, error) {
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		// 跳过空行和注释行
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		// 处理可能包含逗号、制表符、空格分隔的情况
 		parts := strings.FieldsFunc(line, func(r rune) bool {
 			return r == ',' || r == '\t' || r == ' '
 		})
@@ -276,9 +342,8 @@ func readPhonesFromFile(filename string) ([]string, error) {
 	return phones, nil
 }
 
-// 提取手机号（去除空格、特殊字符等）
+// 提取手机号
 func extractPhoneNumber(s string) string {
-	// 只保留数字
 	digits := ""
 	for _, char := range s {
 		if char >= '0' && char <= '9' {
@@ -286,7 +351,6 @@ func extractPhoneNumber(s string) string {
 		}
 	}
 
-	// 如果是11位数字，返回
 	if len(digits) == 11 {
 		return digits
 	}
@@ -311,12 +375,10 @@ func exportResults(results []QueryResult, filename string) error {
 	}
 	defer file.Close()
 
-	// 根据文件扩展名选择格式
 	if strings.HasSuffix(filename, ".csv") {
 		return exportCSV(results, file)
-	} else {
-		return exportTXT(results, file)
 	}
+	return exportTXT(results, file)
 }
 
 // 导出CSV格式
@@ -324,7 +386,6 @@ func exportCSV(results []QueryResult, file *os.File) error {
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	// 根据debug标志决定表头和数据
 	var headers []string
 	if debug {
 		headers = []string{"手机号", "省份", "城市", "邮编", "区号", "运营商", "状态", "错误信息"}
@@ -336,41 +397,28 @@ func exportCSV(results []QueryResult, file *os.File) error {
 		return err
 	}
 
-	// 写入数据
 	for _, r := range results {
 		var row []string
 		if debug {
 			row = []string{
-				r.Phone,
-				r.Province,
-				r.City,
-				r.ZipCode,
-				r.AreaCode,
-				r.CardType,
+				r.Phone, r.Province, r.City, r.ZipCode, r.AreaCode, r.CardType,
 				map[bool]string{true: "成功", false: "失败"}[r.Success],
 				r.ErrorMsg,
 			}
 		} else {
 			row = []string{
-				r.Phone,
-				r.Province,
-				r.City,
-				r.ZipCode,
-				r.AreaCode,
-				r.CardType,
+				r.Phone, r.Province, r.City, r.ZipCode, r.AreaCode, r.CardType,
 			}
 		}
 		if err := writer.Write(row); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
 // 导出TXT格式
 func exportTXT(results []QueryResult, file *os.File) error {
-	// 根据debug标志决定表头和数据格式
 	var header string
 	var dataFormat string
 
@@ -386,7 +434,6 @@ func exportTXT(results []QueryResult, file *os.File) error {
 		return err
 	}
 
-	// 写入数据
 	for _, r := range results {
 		var line string
 		if debug {
@@ -402,6 +449,5 @@ func exportTXT(results []QueryResult, file *os.File) error {
 			return err
 		}
 	}
-
 	return nil
 }
