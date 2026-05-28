@@ -344,97 +344,99 @@ func processPhonesStreaming(inputFile, outputFile string, db *PhoneDatabase) err
 	reader := bufio.NewReader(input)
 
 	var totalCount, successCount, failCount int
+	var lineNum int
 	var currentLine string
 
-	// 逐行读取并处理
-	for lineNum := 1; ; lineNum++ {
-		// 读取一行
+	// 使用逐行读取方式
+	for {
+		lineNum++
+		// 读取一行，包括最后的换行符
 		line, err := reader.ReadString('\n')
+
+		// 处理读取到的内容（即使有错误，只要读取到内容就处理）
+		if len(line) > 0 {
+			// 去除行尾换行符并清理空格
+			currentLine = strings.TrimSpace(strings.TrimRight(line, "\r\n"))
+
+			// 跳过空行和注释行
+			if currentLine != "" && !strings.HasPrefix(currentLine, "#") {
+				// 使用正则表达式提取手机号
+				matches := phoneRegex.FindAllString(currentLine, -1)
+				if len(matches) > 0 {
+					// 处理找到的所有手机号（去重）
+					uniquePhones := make(map[string]bool)
+					for _, phone := range matches {
+						// 验证手机号格式
+						if len(phone) == 11 && isNumeric(phone) {
+							uniquePhones[phone] = true
+						}
+					}
+
+					// 查询每个手机号
+					for phone := range uniquePhones {
+						totalCount++
+						fmt.Printf("🔍 正在查询 [%d]: %s ", totalCount, phone)
+
+						result := QueryResult{Phone: phone}
+
+						// 查询归属地
+						info, err := db.Query(phone)
+						if err != nil {
+							result.Success = false
+							result.ErrorMsg = err.Error()
+							failCount++
+							fmt.Printf(" ❌ 查询失败: %v\n", err)
+						} else {
+							result.Success = true
+							result.Province = info.Province
+							result.City = info.City
+							result.ZipCode = info.ZipCode
+							result.AreaCode = info.AreaCode
+							result.CardType = info.CardType
+							successCount++
+							fmt.Printf(" ✅ %s %s %s 邮编:%s 区号:%s\n",
+								info.Province, info.City, info.CardType, info.ZipCode, info.AreaCode)
+						}
+
+						// 写入CSV
+						var row []string
+						if debug {
+							row = []string{
+								result.Phone, result.Province, result.City, result.ZipCode,
+								result.AreaCode, result.CardType,
+								map[bool]string{true: "成功", false: "失败"}[result.Success],
+								result.ErrorMsg,
+							}
+						} else {
+							row = []string{
+								result.Phone, result.Province, result.City, result.ZipCode,
+								result.AreaCode, result.CardType,
+							}
+						}
+						if err := csvWriter.Write(row); err != nil {
+							return fmt.Errorf("写入结果失败: %w", err)
+						}
+
+						// 定期刷新缓冲区
+						if totalCount%100 == 0 {
+							csvWriter.Flush()
+						}
+
+						// 避免请求过快
+						time.Sleep(10 * time.Millisecond)
+					}
+				} else if debug {
+					fmt.Printf("⚠️ 第%d行未找到有效手机号: %s\n", lineNum, currentLine[:min(len(currentLine), 50)])
+				}
+			}
+		}
+
+		// 检查是否读取完成
 		if err != nil {
 			if err.Error() == "EOF" {
 				break
 			}
 			return fmt.Errorf("读取第%d行失败: %w", lineNum, err)
-		}
-
-		// 去除行尾换行符并清理空格
-		currentLine = strings.TrimSpace(line)
-
-		// 跳过空行和注释行
-		if currentLine == "" || strings.HasPrefix(currentLine, "#") {
-			continue
-		}
-
-		// 使用正则表达式提取手机号
-		matches := phoneRegex.FindAllString(currentLine, -1)
-		if len(matches) == 0 {
-			if debug {
-				fmt.Printf("⚠️ 第%d行未找到有效手机号: %s\n", lineNum, currentLine[:min(len(currentLine), 50)])
-			}
-			continue
-		}
-
-		// 处理找到的所有手机号（去重）
-		uniquePhones := make(map[string]bool)
-		for _, phone := range matches {
-			// 验证手机号格式
-			if len(phone) == 11 && isNumeric(phone) {
-				uniquePhones[phone] = true
-			}
-		}
-
-		// 查询每个手机号
-		for phone := range uniquePhones {
-			totalCount++
-			fmt.Printf("🔍 正在查询 [%d]: %s ", totalCount, phone)
-
-			result := QueryResult{Phone: phone}
-
-			// 查询归属地
-			info, err := db.Query(phone)
-			if err != nil {
-				result.Success = false
-				result.ErrorMsg = err.Error()
-				failCount++
-				fmt.Printf(" ❌ 查询失败: %v\n", err)
-			} else {
-				result.Success = true
-				result.Province = info.Province
-				result.City = info.City
-				result.ZipCode = info.ZipCode
-				result.AreaCode = info.AreaCode
-				result.CardType = info.CardType
-				successCount++
-				fmt.Printf(" ✅ %s %s %s 邮编:%s 区号:%s\n",
-					info.Province, info.City, info.CardType, info.ZipCode, info.AreaCode)
-			}
-
-			// 写入CSV
-			var row []string
-			if debug {
-				row = []string{
-					result.Phone, result.Province, result.City, result.ZipCode,
-					result.AreaCode, result.CardType,
-					map[bool]string{true: "成功", false: "失败"}[result.Success],
-					result.ErrorMsg,
-				}
-			} else {
-				row = []string{
-					result.Phone, result.Province, result.City, result.ZipCode,
-					result.AreaCode, result.CardType,
-				}
-			}
-			if err := csvWriter.Write(row); err != nil {
-				return fmt.Errorf("写入结果失败: %w", err)
-			}
-
-			// 定期刷新缓冲区
-			if totalCount%100 == 0 {
-				csvWriter.Flush()
-			}
-
-			// 避免请求过快
-			time.Sleep(10 * time.Millisecond)
 		}
 
 		// 每处理100行打印一次进度
