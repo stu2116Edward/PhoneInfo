@@ -1,28 +1,21 @@
+//go:build beta
+// +build beta
+
 package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/csv"
 	"flag"
 	"fmt"
+	"io"
 	"os"
-	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
-
-// 查询结果结构
-type QueryResult struct {
-	Phone    string
-	Province string
-	City     string
-	ZipCode  string
-	AreaCode string
-	CardType string
-	Success  bool
-	ErrorMsg string
-}
 
 // 全局调试标志
 var debug bool
@@ -43,6 +36,11 @@ type PhoneInfo struct {
 	CardType string
 }
 
+// 对象池
+var phoneInfoPool = sync.Pool{
+	New: func() interface{} { return &PhoneInfo{} },
+}
+
 func main() {
 	// 解析命令行参数
 	debugFlag := flag.Bool("debug", false, "输出调试信息（状态和错误信息）")
@@ -51,7 +49,7 @@ func main() {
 
 	// 配置参数
 	inputFile := "phones.txt"
-	outputFile := "result.csv"
+	outputFile := "result.txt"
 	phoneDataFile := "phone2region.txt"
 
 	// 加载数据库
@@ -246,159 +244,87 @@ func (db *PhoneDatabase) Query(phonePrefix string) *PhoneInfo {
 	return nil
 }
 
-// processPhonesStreaming 流式处理手机号文件
-func processPhonesStreaming(inputFile, outputFile string, db *PhoneDatabase) error {
-	// 打开输入文件
-	input, err := os.Open(inputFile)
-	if err != nil {
-		return fmt.Errorf("打开输入文件失败: %w", err)
-	}
-	defer input.Close()
+// isHeaderLine 判断文本行是否为表头
+func isHeaderLine(line string) bool {
+	lower := strings.ToLower(line)
+	return strings.Contains(lower, "mobile") || strings.Contains(lower, "手机号") || strings.Contains(lower, "cardno") || strings.Contains(lower, "username") || strings.Contains(lower, "address")
+}
 
-	// 创建输出文件
-	output, err := os.Create(outputFile)
-	if err != nil {
-		return fmt.Errorf("创建输出文件失败: %w", err)
-	}
-	defer output.Close()
+// isDigitByte 判断字节是否为数字字符
+func isDigitByte(b byte) bool {
+	return b >= '0' && b <= '9'
+}
 
-	// 创建CSV写入器
-	csvWriter := csv.NewWriter(output)
-	defer csvWriter.Flush()
-
-	// 写入CSV头部
-	var headers []string
-	if debug {
-		headers = []string{"手机号", "省份", "城市", "邮编", "区号", "运营商", "状态", "错误信息"}
-	} else {
-		headers = []string{"手机号", "省份", "城市", "邮编", "区号", "运营商"}
-	}
-	if err := csvWriter.Write(headers); err != nil {
-		return fmt.Errorf("写入CSV头部失败: %w", err)
+// extractPhonesFromBytes 从字节切片中提取所有手机号（零分配，按字节扫描）
+func extractPhonesFromBytes(line []byte) []string {
+	lineLen := len(line)
+	if lineLen < 11 {
+		return nil
 	}
 
-	// 编译手机号正则表达式（支持11位数字）
-	// \b - 单词边界，确保手机号前后不是数字、字母或下划线
-	// 1[3-9]\d{9} - 匹配11位手机号（1开头，第二位3-9，后面9位数字）
-	// \b - 单词边界，确保手机号结束后也不是数字、字母或下划线
-	phoneRegex := regexp.MustCompile(`\b1[3-9]\d{9}\b`)
+	var phones []string
 
-	// 创建带缓冲的读取器
-	reader := bufio.NewReader(input)
-
-	var totalCount, successCount, failCount int
-	var lineNum int
-
-	// 使用逐行读取方式
-	for {
-		lineNum++
-		// 读取一行，包括最后的换行符
-		line, err := reader.ReadString('\n')
-
-		// 处理读取到的内容（即使有错误，只要读取到内容就处理）
-		if len(line) > 0 {
-			// 去除行尾换行符并清理空格
-			currentLine := strings.TrimSpace(strings.TrimRight(line, "\r\n"))
-
-			// 跳过空行和注释行
-			if currentLine != "" && !strings.HasPrefix(currentLine, "#") {
-				// 使用正则表达式提取手机号
-				matches := phoneRegex.FindAllString(currentLine, -1)
-				if len(matches) > 0 {
-					// 处理找到的所有手机号（去重）
-					uniquePhones := make(map[string]bool)
-					for _, phone := range matches {
-						// 验证手机号格式
-						if len(phone) == 11 && isNumeric(phone) {
-							uniquePhones[phone] = true
-						}
-					}
-
-					// 查询每个手机号
-					for phone := range uniquePhones {
-						totalCount++
-						fmt.Printf("🔍 正在查询 [%d]: %s ", totalCount, phone)
-
-						result := QueryResult{Phone: phone}
-
-						// 提取前7位作为查询key
-						phonePrefix := phone[0:7]
-
-						// 查询归属地
-						info := db.Query(phonePrefix)
-						if info != nil {
-							result.Success = true
-							result.Province = info.Province
-							result.City = info.City
-							result.ZipCode = info.ZipCode
-							result.AreaCode = info.AreaCode
-							result.CardType = info.CardType
-							successCount++
-							fmt.Printf(" ✅ %s %s %s 邮编:%s 区号:%s\n",
-								info.Province, info.City, info.CardType, info.ZipCode, info.AreaCode)
-						} else {
-							result.Success = false
-							result.ErrorMsg = fmt.Sprintf("未找到号段 %s 的归属地", phonePrefix)
-							failCount++
-							fmt.Printf(" ❌ 未找到号段 %s\n", phonePrefix)
-						}
-
-						// 写入CSV
-						var row []string
-						if debug {
-							row = []string{
-								result.Phone, result.Province, result.City, result.ZipCode,
-								result.AreaCode, result.CardType,
-								map[bool]string{true: "成功", false: "失败"}[result.Success],
-								result.ErrorMsg,
-							}
-						} else {
-							row = []string{
-								result.Phone, result.Province, result.City, result.ZipCode,
-								result.AreaCode, result.CardType,
-							}
-						}
-						if err := csvWriter.Write(row); err != nil {
-							return fmt.Errorf("写入结果失败: %w", err)
-						}
-
-						// 定期刷新缓冲区
-						if totalCount%100 == 0 {
-							csvWriter.Flush()
-						}
-
-						// 避免请求过快
-						time.Sleep(10 * time.Millisecond)
-					}
-				} else if debug {
-					fmt.Printf("⚠️ 第%d行未找到有效手机号: %s\n", lineNum, currentLine[:min(len(currentLine), 50)])
-				}
-			}
+	for i := 0; i <= lineLen-11; i++ {
+		// 检查前面不能是数字（负向后顾）
+		if i > 0 && isDigitByte(line[i-1]) {
+			continue
 		}
 
-		// 检查是否读取完成
-		if err != nil {
-			if err.Error() == "EOF" {
+		// 检查第一位必须是 '1'
+		if line[i] != '1' {
+			continue
+		}
+
+		// 检查第二位必须在 3-9 之间
+		second := line[i+1]
+		if second < '3' || second > '9' {
+			continue
+		}
+
+		// 检查第3-11位必须都是数字（共9位）
+		isValid := true
+		for j := 2; j <= 10; j++ {
+			if !isDigitByte(line[i+j]) {
+				isValid = false
 				break
 			}
-			return fmt.Errorf("读取第%d行失败: %w", lineNum, err)
+		}
+		if !isValid {
+			continue
 		}
 
-		// 每处理100行打印一次进度
-		if lineNum%100 == 0 {
-			fmt.Printf("\n📊 进度: 已处理 %d 行, 查询 %d 个手机号, 成功 %d, 失败 %d\n",
-				lineNum, totalCount, successCount, failCount)
+		// 检查后面不能是数字（正向后顾）
+		if i+11 < lineLen && isDigitByte(line[i+11]) {
+			continue
 		}
+
+		// 找到有效手机号
+		phone := string(line[i : i+11])
+		phones = append(phones, phone)
+
+		if debug {
+			fmt.Printf("DEBUG: 提取到手机号: %s\n", phone)
+		}
+
+		// 跳过已检查的部分，避免重复匹配
+		i += 10
 	}
 
-	// 打印统计信息
-	fmt.Println("\n📊 查询统计:")
-	fmt.Printf("  总查询数: %d\n", totalCount)
-	fmt.Printf("  ✅ 成功: %d\n", successCount)
-	fmt.Printf("  ❌ 失败: %d\n", failCount)
-	fmt.Printf("  📄 结果已保存到: %s\n", outputFile)
+	return phones
+}
 
-	return nil
+// ResetPhoneInfo 重置 PhoneInfo 以便放回池中复用
+func ResetPhoneInfo(info *PhoneInfo) {
+	info.Province = ""
+	info.City = ""
+	info.ZipCode = ""
+	info.AreaCode = ""
+	info.CardType = ""
+}
+
+// isUnknown 判断是否为未知归属地
+func isUnknown(info *PhoneInfo) bool {
+	return info.Province == "未知" || info.City == "未知" || info.Province == ""
 }
 
 // 检查字符串是否全是数字
@@ -411,10 +337,230 @@ func isNumeric(s string) bool {
 	return true
 }
 
-// min 返回两个整数中的较小值
-func min(a, b int) int {
-	if a < b {
-		return a
+// processPhonesStreaming 流式处理手机号文件
+func processPhonesStreaming(inputFile, outputFile string, db *PhoneDatabase) error {
+	input, err := os.Open(inputFile)
+	if err != nil {
+		return fmt.Errorf("打开输入文件失败: %w", err)
 	}
-	return b
+	defer input.Close()
+
+	output, err := os.Create(outputFile)
+	if err != nil {
+		return fmt.Errorf("创建输出文件失败: %w", err)
+	}
+	defer output.Close()
+
+	// 写入 UTF-8 BOM 头
+	if _, err := output.Write([]byte("\uFEFF")); err != nil {
+		return fmt.Errorf("写入UTF-8 BOM失败: %w", err)
+	}
+
+	bufOut := bufio.NewWriterSize(output, 1<<20) // 1MB 缓冲区
+	csvWriter := csv.NewWriter(bufOut)
+	defer func() {
+		csvWriter.Flush()
+		bufOut.Flush()
+	}()
+
+	// 写入 CSV 头部
+	if err := csvWriter.Write([]string{"手机号", "省份", "城市", "邮编", "区号", "运营商"}); err != nil {
+		return fmt.Errorf("写入CSV头部失败: %w", err)
+	}
+
+	reader := bufio.NewReader(input)
+
+	var totalRows, totalCount, unknownCount int64
+	row := make([]string, 0, 6)
+
+	startTime := time.Now()
+	// 每 0.5 秒打印一次进度
+	printInterval := 500 * time.Millisecond
+
+	stopProgress := make(chan bool)
+	progressDone := make(chan bool)
+
+	go func() {
+		ticker := time.NewTicker(printInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				printProgress(totalRows, totalCount, unknownCount, startTime)
+			case <-stopProgress:
+				printProgress(totalRows, totalCount, unknownCount, startTime)
+				progressDone <- true
+				return
+			}
+		}
+	}()
+
+	firstRecord := true
+	for {
+		lineBytes, err := reader.ReadBytes('\n')
+		if err != nil && err != io.EOF {
+			close(stopProgress)
+			<-progressDone
+			return fmt.Errorf("读取文本行失败: %w", err)
+		}
+
+		// 去除行尾换行符（兼容 CRLF）
+		lineBytes = bytes.TrimRight(lineBytes, "\r\n")
+		lineLen := len(lineBytes)
+
+		// 将行计数提前，确保即使 EOF 空行也被计入
+		totalRows++
+
+		// 如果是 EOF 且当前行为空，则退出循环
+		if err == io.EOF && lineLen == 0 {
+			break
+		}
+
+		if totalRows == 1 && lineLen > 0 && lineBytes[0] == 0xEF {
+			// 跳过 UTF-8 BOM
+			if lineLen >= 3 && lineBytes[0] == 0xEF && lineBytes[1] == 0xBB && lineBytes[2] == 0xBF {
+				lineBytes = lineBytes[3:]
+				lineLen = len(lineBytes)
+			}
+		}
+
+		// 去除首尾空白
+		trimmed := bytes.TrimSpace(lineBytes)
+		trimmedLen := len(trimmed)
+
+		if firstRecord {
+			if trimmedLen == 0 {
+				if err == io.EOF {
+					break
+				}
+				continue
+			}
+			firstRecord = false
+			if isHeaderLine(string(trimmed)) {
+				if debug {
+					fmt.Println("DEBUG: 跳过CSV/文本头部")
+				}
+				if err == io.EOF {
+					break
+				}
+				continue
+			}
+		}
+
+		if trimmedLen == 0 {
+			if err == io.EOF {
+				break
+			}
+			continue
+		}
+
+		phones := extractPhonesFromBytes(trimmed)
+		if len(phones) == 0 {
+			if err == io.EOF {
+				break
+			}
+			continue
+		}
+
+		for _, phone := range phones {
+			totalCount++
+			// 提取前7位作为查询key
+			phonePrefix := phone[0:7]
+
+			// 查询归属地
+			info := db.Query(phonePrefix)
+
+			if info == nil {
+				// 未找到，从池中获取默认PhoneInfo
+				info = phoneInfoPool.Get().(*PhoneInfo)
+				info.Province = "未知"
+				info.City = "未知"
+				info.ZipCode = ""
+				info.AreaCode = ""
+				info.CardType = "未知"
+				unknownCount++
+				if debug {
+					fmt.Printf("DEBUG: 未知归属地手机号: %s (第 %d 行)\n", phone, totalRows)
+				}
+			} else {
+				// 找到了，从池中获取PhoneInfo副本
+				poolInfo := phoneInfoPool.Get().(*PhoneInfo)
+				poolInfo.Province = info.Province
+				poolInfo.City = info.City
+				poolInfo.ZipCode = info.ZipCode
+				poolInfo.AreaCode = info.AreaCode
+				poolInfo.CardType = info.CardType
+				info = poolInfo
+			}
+
+			row = row[:0]
+			row = append(row, phone, info.Province, info.City, info.ZipCode, info.AreaCode, info.CardType)
+			if err := csvWriter.Write(row); err != nil {
+				close(stopProgress)
+				<-progressDone
+				return fmt.Errorf("写入CSV失败: %w", err)
+			}
+
+			ResetPhoneInfo(info)
+			phoneInfoPool.Put(info)
+
+			if totalCount%100000 == 0 {
+				csvWriter.Flush()
+				bufOut.Flush()
+			}
+		}
+
+		if err == io.EOF {
+			break
+		}
+	}
+
+	close(stopProgress)
+	<-progressDone
+
+	csvWriter.Flush()
+	bufOut.Flush()
+
+	printFinalStats(totalRows, totalCount, unknownCount, time.Since(startTime), outputFile)
+	return nil
+}
+
+// printProgress 打印进度信息
+func printProgress(totalRows, totalCount, unknownCount int64, startTime time.Time) {
+	elapsed := time.Since(startTime)
+	if totalCount > 0 {
+		rate := float64(totalCount) / elapsed.Seconds()
+		fmt.Printf("\r📊 进度: 已处理 %d 行, 查询 %d 个手机号 (%.0f 条/秒) 耗时: %v | 未知归属地: %d",
+			totalRows, totalCount, rate, elapsed.Round(time.Second), unknownCount)
+	} else if totalRows > 0 {
+		fmt.Printf("\r📊 进度: 已处理 %d 行, 等待发现手机号... 耗时: %v",
+			totalRows, elapsed.Round(time.Second))
+	}
+}
+
+// printFinalStats 打印最终统计信息
+func printFinalStats(totalRows, totalCount, unknownCount int64, elapsed time.Duration, outputFile string) {
+	fmt.Print("\n")
+	fmt.Printf("✅ 处理完成！\n")
+	fmt.Printf("   总行数: %d 行\n", totalRows)
+	fmt.Printf("   总查询数: %d 个手机号\n", totalCount)
+
+	if totalCount > 0 {
+		rate := float64(totalCount) / elapsed.Seconds()
+		unknownPercent := float64(unknownCount) / float64(totalCount) * 100
+		fmt.Printf("   未知归属地: %d 个 (%.2f%%)\n", unknownCount, unknownPercent)
+		fmt.Printf("   已知归属地: %d 个 (%.2f%%)\n", totalCount-unknownCount, 100-unknownPercent)
+		fmt.Printf("   总耗时: %v\n", elapsed.Round(time.Second))
+		fmt.Printf("   平均速度: %.0f 个手机号/秒\n", rate)
+
+		if unknownPercent > 10 {
+			fmt.Printf("\n⚠️  提示: 发现 %d 个未知归属地的手机号 (占 %.1f%%)，可能是号段数据库版本较旧\n",
+				unknownCount, unknownPercent)
+		}
+	} else {
+		fmt.Printf("   未发现任何有效手机号\n")
+		fmt.Printf("   总耗时: %v\n", elapsed.Round(time.Second))
+	}
+
+	fmt.Printf("   结果已保存到: %s\n", outputFile)
 }
