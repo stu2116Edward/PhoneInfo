@@ -34,3 +34,7 @@ go run beta.go
 ```
 go run beta.go --debug
 ```
+
+### 运行结果
+<img width="1075" height="315" alt="PIF1" src="https://github.com/user-attachments/assets/376a82e5-a4d3-49e0-8338-8ae47dd099f2" />  
+<img width="1047" height="366" alt="PIF2" src="https://github.com/user-attachments/assets/8cf945d5-8fa4-4a56-aa70-251e4c422748" />  
